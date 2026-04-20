@@ -314,6 +314,16 @@ class Image(object):
 
         return tmp_dir
 
+    def _gzip_file(self, source, target):
+        self.log.debug("Compressing '%s' to '%s'...", source, target)
+
+        with open(source, "rb") as f_in:
+            with open(target, "wb") as raw_out:
+                with gzip.GzipFile(
+                    filename="", mode="wb", fileobj=raw_out, mtime=0
+                ) as f_out:
+                    shutil.copyfileobj(f_in, f_out)
+
     def _load_image(self, directory):
         tar_file = os.path.join(self.tmp_dir, "image.tar")
 

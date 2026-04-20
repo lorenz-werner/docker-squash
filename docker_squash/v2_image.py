@@ -16,6 +16,10 @@ class V2Image(Image):
     def _before_squashing(self):
         super(V2Image, self)._before_squashing()
 
+        self.squashed_diff_id = None
+        self.squashed_blob_path = None
+        self.squashed_blob_digest = None
+
         # Read old image manifest file
         self.old_image_manifest = self._get_manifest()
         self.log.debug(
@@ -48,6 +52,10 @@ class V2Image(Image):
             os.makedirs(self.squashed_dir)
             # Merge data layers
             self._squash_layers(self.layer_paths_to_squash, self.layer_paths_to_move)
+            # Keep diff_id based on the uncompressed tar we just created.
+            self.squashed_diff_id = self._compute_sha256(
+                os.path.join(self.squashed_dir, "layer.tar")
+            )
 
         self.diff_ids = self._generate_diff_ids()
         self.chain_ids = self._generate_chain_ids(self.diff_ids)
@@ -58,30 +66,34 @@ class V2Image(Image):
         layer_path_id = None
 
         if self.layer_paths_to_squash:
-            # Compute layer id to use to name the directory where
-            # we store the layer data inside of the tar archive
-            layer_path_id = self._generate_squashed_layer_path_id()
-
             if self.oci_format:
-                old_layer_path = self.old_image_manifest["Config"]
+                # Docker 29+ exports OCI/blob-style archives. Preserve that
+                # shape for the newly created squashed layer as well.
+                layer_path_id = self._write_squashed_blob()
             else:
+                # Compute layer id to use to name the directory where
+                # we store the layer data inside of the tar archive
+                layer_path_id = self._generate_squashed_layer_path_id()
+
                 if self.layer_paths_to_squash[0]:
                     old_layer_path = self.layer_paths_to_squash[0]
                 else:
                     old_layer_path = layer_path_id
                 old_layer_path = os.path.join(old_layer_path, "json")
 
-            metadata = self._generate_last_layer_metadata(layer_path_id, old_layer_path)
-            self._write_squashed_layer_metadata(metadata)
+                metadata = self._generate_last_layer_metadata(
+                    layer_path_id, old_layer_path
+                )
+                self._write_squashed_layer_metadata(metadata)
 
-            # Write version file to the squashed layer
-            # Even Docker doesn't know why it's needed...
-            self._write_version_file(self.squashed_dir)
+                # Write version file to the squashed layer
+                # Even Docker doesn't know why it's needed...
+                self._write_version_file(self.squashed_dir)
 
-            # Move the temporary squashed layer directory to the correct one
-            shutil.move(
-                self.squashed_dir, os.path.join(self.new_image_dir, layer_path_id)
-            )
+                # Move the temporary squashed layer directory to the correct one
+                shutil.move(
+                    self.squashed_dir, os.path.join(self.new_image_dir, layer_path_id)
+                )
 
         manifest = self._generate_manifest_metadata(
             image_id,
@@ -94,7 +106,11 @@ class V2Image(Image):
 
         self._write_manifest_metadata(manifest)
 
-        repository_image_id = manifest[0]["Layers"][-1].split("/")[0]
+        if self.oci_format:
+            # "blobs/sha256/<digest>" would otherwise yield "blobs", which is wrong.
+            repository_image_id = image_id
+        else:
+            repository_image_id = manifest[0]["Layers"][-1].split("/")[0]
 
         # Move all the layers that should be untouched
         self._move_layers(
@@ -112,7 +128,14 @@ class V2Image(Image):
         # Create JSON from the metadata
         # Docker adds new line at the end
         json_metadata, image_id = self._dump_json(metadata, True)
-        image_metadata_file = os.path.join(self.new_image_dir, "%s.json" % image_id)
+
+        if self.oci_format:
+            image_metadata_file = os.path.join(
+                self.new_image_dir, "blobs", "sha256", image_id
+            )
+            os.makedirs(os.path.dirname(image_metadata_file), exist_ok=True)
+        else:
+            image_metadata_file = os.path.join(self.new_image_dir, "%s.json" % image_id)
 
         self._write_json_metadata(json_metadata, image_metadata_file)
 
@@ -140,7 +163,11 @@ class V2Image(Image):
         layer_path_id=None,
     ):
         manifest = OrderedDict()
-        manifest["Config"] = "%s.json" % image_id
+
+        if self.oci_format:
+            manifest["Config"] = os.path.join("blobs", "sha256", image_id)
+        else:
+            manifest["Config"] = "%s.json" % image_id
 
         if image_name and image_tag:
             manifest["RepoTags"] = ["%s:%s" % (image_name, image_tag)]
@@ -148,7 +175,10 @@ class V2Image(Image):
         manifest["Layers"] = old_image_manifest["Layers"][: len(layer_paths_to_move)]
 
         if layer_path_id:
-            manifest["Layers"].append("%s/layer.tar" % layer_path_id)
+            if self.oci_format:
+                manifest["Layers"].append(layer_path_id)
+            else:
+                manifest["Layers"].append("%s/layer.tar" % layer_path_id)
 
         return [manifest]
 
@@ -234,7 +264,9 @@ class V2Image(Image):
             diff_ids.append(sha256)
 
         if self.layer_paths_to_squash:
-            sha256 = self._compute_sha256(os.path.join(self.squashed_dir, "layer.tar"))
+            sha256 = self.squashed_diff_id or self._compute_sha256(
+                os.path.join(self.squashed_dir, "layer.tar")
+            )
             diff_ids.append(sha256)
 
         return diff_ids
@@ -253,6 +285,30 @@ class V2Image(Image):
                 sha256.update(data)
 
         return sha256.hexdigest()
+
+    def _write_squashed_blob(self):
+        blobs_dir = os.path.join(self.new_image_dir, "blobs", "sha256")
+        os.makedirs(blobs_dir, exist_ok=True)
+
+        compressed_tmp = os.path.join(self.tmp_dir, "layer.tar.gz")
+        self._gzip_file(self.squashed_tar, compressed_tmp)
+
+        compressed_digest = self._compute_sha256(compressed_tmp)
+        target = os.path.join(blobs_dir, compressed_digest)
+        shutil.move(compressed_tmp, target)
+
+        self.squashed_blob_digest = compressed_digest
+        self.squashed_blob_path = os.path.join(
+            "blobs", "sha256", compressed_digest
+        )
+
+        self.log.debug(
+            "Stored squashed OCI blob at '%s' (sha256:%s)",
+            self.squashed_blob_path,
+            self.squashed_blob_digest,
+        )
+
+        return self.squashed_blob_path
 
     def _generate_squashed_layer_path_id(self):
         """
