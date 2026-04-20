@@ -1,4 +1,5 @@
 import datetime
+import gzip
 import hashlib
 import itertools
 import json
